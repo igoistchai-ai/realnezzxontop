@@ -1,0 +1,11 @@
+{
+  "name": "visual-gifter-demo",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node launcher.cjs"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
