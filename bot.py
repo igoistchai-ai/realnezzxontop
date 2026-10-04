@@ -1,400 +1,404 @@
 """
-Telegram-бот для управления ключами доступа к фейк-гифт странице Roblox.
-
-УСТАНОВКА:
-  pip install python-telegram-bot==20.7
-
-ЗАПУСК:
-  export BOT_TOKEN=<ваш токен от @BotFather>
-  export ADMIN_TOKEN=<admin token из server.mjs — смотри в логах при старте>
-  export SITE_URL=https://your-render-app.onrender.com
-  python bot.py
-
-КОМАНДЫ БОТА (только для @ADMIN_USERNAME):
-  /start            — приветствие
-  /ключ @username 50000 VisualNick 1ч — выдать временный ключ
-  /keys             — список всех ключей
-  /config           — посмотреть/изменить глобальные настройки
-
-НАСТРОЙКИ перед выдачей ключа (через /set):
-  /set robux 50000        — установить количество RB для следующего ключа
-  /set nick Astrix_Gaming — установить ник профиля
-  /set name Astrix        — установить отображаемое имя
-  /set item "Headless Horseman"  — название предмета
-  /set price 31000        — цена предмета
+Telegram admin bot for a clearly labeled visual/demo site.
+Requires: python-telegram-bot==20.7, httpx
+Environment: BOT_TOKEN, ADMIN_TOKEN, SITE_URL, ADMIN_IDS
 """
-
 import os
-import logging
-import asyncio
 import re
 import time
-import httpx
+import html
+import logging
+import secrets
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters,
 )
+import httpx
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("demo_admin_bot")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-ADMIN_TOKEN = os.environ["ADMIN_TOKEN"]
-SITE_URL = os.environ.get("SITE_URL", "http://localhost:10000").rstrip("/")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+SITE_URL = os.getenv("SITE_URL", "http://localhost:10000").rstrip("/")
+ADMIN_IDS = {
+    int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+ADMIN_USERNAMES = {
+    x.strip().lstrip("@").lower()
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip() and not x.strip().isdigit()
+}
 
-# Telegram username или ID администраторов (добавь свои)
-ADMIN_IDS: set[int] = set()
-ADMIN_USERNAMES: set[str] = set()
-
-# ── загружаем из переменных окружения ──────────────────────────────────────
-raw_admin_ids = os.environ.get("ADMIN_IDS", "")
-for part in raw_admin_ids.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ADMIN_IDS.add(int(part))
-    elif part.startswith("@"):
-        ADMIN_USERNAMES.add(part.lstrip("@").lower())
-    elif part:
-        ADMIN_USERNAMES.add(part.lower())
-
-# ── временные настройки на каждого пользователя (для следующего ключа) ──────
+# Per-admin settings for the next demo key. These reset when the bot restarts.
 pending_settings: dict[int, dict] = {}
+WAIT_RECIPIENT, WAIT_AMOUNT, WAIT_NICK, WAIT_DURATION = range(4)
 
-def default_settings() -> dict:
+def defaults():
     return {
         "robuxBalance": 150000,
         "profileUsername": "Builderman",
         "profileDisplayName": "Builderman",
-        "itemName": "Headless Horseman",
+        "itemName": "Demo item",
         "itemPrice": 31000,
     }
 
-def get_settings(user_id: int) -> dict:
-    if user_id not in pending_settings:
-        pending_settings[user_id] = default_settings()
-    return pending_settings[user_id]
+def settings_for(uid):
+    return pending_settings.setdefault(uid, defaults().copy())
 
-
-def is_admin(update: Update) -> bool:
+def is_admin(update: Update):
     user = update.effective_user
-    if user is None:
-        return False
-    if user.id in ADMIN_IDS:
-        return True
-    if user.username and user.username.lower() in ADMIN_USERNAMES:
-        return True
-    # Никогда не назначаем администратора автоматически.
-    return False
+    return bool(user and (
+        user.id in ADMIN_IDS or
+        (user.username and user.username.lower() in ADMIN_USERNAMES)
+    ))
 
+def admin_only(fn):
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not is_admin(update):
+            if update.callback_query:
+                await update.callback_query.answer("Нет доступа", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text("⛔ Нет доступа.")
+            return
+        return await fn(update, context, *args, **kwargs)
+    return wrapped
 
-async def api_post(endpoint: str, payload: dict) -> dict:
-    payload["admin_token"] = ADMIN_TOKEN
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.post(f"{SITE_URL}{endpoint}", json=payload)
-        r.raise_for_status()
-        return r.json()
+def menu():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔑 Выдать демо-ключ", callback_data="give")],
+        [InlineKeyboardButton("📋 Список ключей", callback_data="keys"),
+         InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
+        [InlineKeyboardButton("🌐 Обновить конфиг сайта", callback_data="update"),
+         InlineKeyboardButton("ℹ️ Помощь", callback_data="help")],
+    ])
 
+async def api(method, endpoint, payload=None):
+    if not ADMIN_TOKEN:
+        raise RuntimeError("Не задан ADMIN_TOKEN в Render Environment")
+    headers = {}
+    params = {"admin_token": ADMIN_TOKEN}
+    async with httpx.AsyncClient(timeout=20) as client:
+        if method == "POST":
+            body = dict(payload or {})
+            body["admin_token"] = ADMIN_TOKEN
+            response = await client.post(SITE_URL + endpoint, json=body, headers=headers)
+        else:
+            response = await client.get(SITE_URL + endpoint, params=params)
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError:
+            return {}
 
-async def api_get(endpoint: str, params: dict | None = None) -> dict:
-    p = dict(params or {})
-    p["admin_token"] = ADMIN_TOKEN
-    async with httpx.AsyncClient(timeout=15) as client:
-        r = await client.get(f"{SITE_URL}{endpoint}", params=p)
-        r.raise_for_status()
-        return r.json()
+async def send_or_edit(update, text, keyboard=None, parse_mode=None):
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        await q.edit_message_text(text, reply_markup=keyboard, parse_mode=parse_mode)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=keyboard, parse_mode=parse_mode)
 
-
-# ── /start ──────────────────────────────────────────────────────────────────
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
-        await update.message.reply_text(
-            "👋 Привет! Этот бот для выдачи ключей к фейк-гифт странице.\n"
-            "Напиши администратору, чтобы получить ключ."
+        await update.effective_message.reply_text(
+            "Привет! Это бот управления демонстрационным сайтом. "
+            "Обратитесь к администратору за доступом."
         )
         return
-
-    await update.message.reply_html(
-        f"👋 Привет, <b>{user.first_name}</b>!\n\n"
-        "Доступные команды:\n"
-        "• /give @username — выдать ключ пользователю\n"
-        "• /set robux 50000 — кол-во RB для следующего ключа\n"
-        "• /set nick Username — ник профиля\n"
-        "• /set name DisplayName — отображаемое имя\n"
-        "• /set item Название — название предмета\n"
-        "• /set price 31000 — цена предмета\n"
-        "• /settings — текущие настройки\n"
-        "• /keys — список всех ключей\n"
-        "• /update — обновить глобальный конфиг сайта\n\n"
-        f"🌐 Сайт: {SITE_URL}\n"
-        f"🔑 Страница входа: {SITE_URL}/login"
+    await update.effective_message.reply_text(
+        f"👋 <b>Панель управления демо-сайтом</b>\n\nСайт: {html.escape(SITE_URL)}",
+        reply_markup=menu(), parse_mode="HTML"
     )
 
-
-# ── /settings ───────────────────────────────────────────────────────────────
-async def settings_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+async def help_cmd(update, context):
     if not is_admin(update):
         return
-    s = get_settings(update.effective_user.id)
-    text = (
-        "⚙️ <b>Настройки следующего ключа:</b>\n\n"
-        f"💎 RB: <code>{s['robuxBalance']:,}</code>\n"
-        f"👤 Ник: <code>{s['profileUsername']}</code>\n"
-        f"📛 Имя: <code>{s['profileDisplayName']}</code>\n"
-        f"🎁 Предмет: <code>{s['itemName']}</code>\n"
-        f"💰 Цена: <code>{s['itemPrice']:,}</code> RB\n\n"
-        "Меняй через /set ключ значение\n"
-        "Например: /set robux 50000"
+    await update.effective_message.reply_text(
+        "Кнопки меню управляют демо-сайтом.\n\n"
+        "/give — мастер создания тестового ключа\n"
+        "/keys — список ключей\n"
+        "/settings — настройки следующего ключа\n"
+        "/set ПАРАМЕТР ЗНАЧЕНИЕ — изменить настройку\n"
+        "/update — отправить настройки на сайт\n"
+        "/cancel — отменить мастер\n\n"
+        "Параметры: robux, nick, name, item, price.\n"
+        "Все балансы и награды здесь — только визуальные демонстрационные данные.",
+        reply_markup=menu()
     )
-    await update.message.reply_html(text)
 
+async def settings_text(uid):
+    s = settings_for(uid)
+    return (
+        "⚙️ <b>Настройки следующего демо-ключа</b>\n\n"
+        f"💎 Визуальный баланс: <code>{s['robuxBalance']:,}</code>\n"
+        f"👤 Ник: <code>{html.escape(str(s['profileUsername']))}</code>\n"
+        f"📛 Имя: <code>{html.escape(str(s['profileDisplayName']))}</code>\n"
+        f"🎁 Демо-предмет: <code>{html.escape(str(s['itemName']))}</code>\n"
+        f"💰 Визуальная цена: <code>{s['itemPrice']:,}</code>\n\n"
+        "Изменить: /set robux 50000 или кнопкой ниже."
+    )
 
-# ── /set ─────────────────────────────────────────────────────────────────────
-async def set_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
-    args = ctx.args
-    if not args or len(args) < 2:
-        await update.message.reply_text(
-            "Использование:\n"
-            "/set robux 50000\n"
-            "/set nick Username\n"
-            "/set name DisplayName\n"
-            "/set item Headless Horseman\n"
-            "/set price 31000"
-        )
-        return
+async def settings_cmd(update, context):
+    if not is_admin(update): return
+    await update.effective_message.reply_text(
+        await settings_text(update.effective_user.id),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💎 Баланс", callback_data="edit:robux"),
+             InlineKeyboardButton("👤 Ник", callback_data="edit:nick")],
+            [InlineKeyboardButton("📛 Имя", callback_data="edit:name"),
+             InlineKeyboardButton("🎁 Предмет", callback_data="edit:item")],
+            [InlineKeyboardButton("💰 Цена", callback_data="edit:price")],
+            [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+        ])
+    )
 
-    s = get_settings(update.effective_user.id)
-    key = args[0].lower()
-    value = " ".join(args[1:])
-
+async def set_cmd(update, context):
+    if not is_admin(update): return
+    if len(context.args) < 2:
+        await update.effective_message.reply_text(
+            "Формат: /set robux 50000\nПараметры: robux, nick, name, item, price"
+        ); return
+    field, value = context.args[0].lower(), " ".join(context.args[1:])
     mapping = {
-        "robux": ("robuxBalance", int, "💎 RB установлен: {v:,}"),
-        "nick": ("profileUsername", str, "👤 Ник установлен: {v}"),
-        "name": ("profileDisplayName", str, "📛 Имя установлено: {v}"),
-        "item": ("itemName", str, "🎁 Предмет: {v}"),
-        "price": ("itemPrice", int, "💰 Цена: {v:,} RB"),
+        "robux": ("robuxBalance", int), "nick": ("profileUsername", str),
+        "name": ("profileDisplayName", str), "item": ("itemName", str),
+        "price": ("itemPrice", int),
     }
-
-    if key not in mapping:
-        await update.message.reply_text(
-            f"Неизвестный параметр: {key}\n"
-            "Доступны: robux, nick, name, item, price"
-        )
-        return
-
-    field, cast, msg_fmt = mapping[key]
+    if field not in mapping:
+        await update.effective_message.reply_text("Неизвестный параметр."); return
+    target, cast = mapping[field]
     try:
-        s[field] = cast(value)
-        msg = msg_fmt.replace("{v}", str(s[field]))
-        # For int formatting
-        if cast == int:
-            msg = msg_fmt.format(v=s[field])
-        await update.message.reply_text(f"✅ {msg}")
-    except (ValueError, TypeError):
-        await update.message.reply_text(f"❌ Неверное значение: {value}")
-
-
-# ── /give @username ──────────────────────────────────────────────────────────
-def parse_duration(value: str) -> int | None:
-    """Возвращает длительность в миллисекундах."""
-    m = re.fullmatch(r"(\d+)(ч|д|мес|м|год)", value.strip().lower())
-    if not m:
-        return None
-    amount = int(m.group(1))
-    unit = m.group(2)
-    multipliers = {
-        "м": 60_000,
-        "ч": 3_600_000,
-        "д": 86_400_000,
-        "мес": 30 * 86_400_000,
-        "год": 365 * 86_400_000,
-    }
-    return amount * multipliers[unit]
-
-
-async def give_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Админская выдача временного ключа.
-
-    Формат:
-      /ключ @username 50000 VisualNick 1ч
-      /ключ 123456789 50000 Visual Nick 1мес
-    Последний аргумент — срок, предпоследние аргументы — визуальный ник.
-    """
-    if not is_admin(update):
-        return
-
-    args = ctx.args
-    if len(args) < 4:
-        await update.message.reply_text(
-            "Использование:\n"
-            "/ключ @username 50000 VisualNick 1ч\n"
-            "/ключ 123456789 50000 Visual Nick 1мес\n\n"
-            "Срок: 1ч, 1д, 1м, 1мес, 1год."
-        )
-        return
-
-    recipient_tg = args[0].lstrip("@")
-    try:
-        robux = int(args[1].replace(",", "").replace(" ", ""))
+        parsed = cast(value)
+        if cast is int and parsed < 0: raise ValueError
+        settings_for(update.effective_user.id)[target] = parsed
     except ValueError:
-        await update.message.reply_text("❌ Сумма Robux должна быть числом.")
-        return
+        await update.effective_message.reply_text("Нужно указать корректное неотрицательное число."); return
+    await update.effective_message.reply_text(
+        "✅ Сохранено.\n\n" + await settings_text(update.effective_user.id),
+        parse_mode="HTML", reply_markup=menu()
+    )
 
-    duration_text = args[-1]
+def parse_duration(value):
+    match = re.fullmatch(r"(\d+)(ч|д|м|мес|год)", value.strip().lower())
+    if not match: return None
+    n, unit = int(match.group(1)), match.group(2)
+    mult = {"ч":3600000, "д":86400000, "м":60000,
+            "мес":30*86400000, "год":365*86400000}
+    return n * mult[unit] if n > 0 else None
+
+@admin_only
+async def give_start(update, context):
+    context.user_data["give"] = {}
+    await update.effective_message.reply_text(
+        "Кому выдать тестовый ключ?\nОтправь Telegram ID или username (например @name).",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Отмена", callback_data="cancel")]])
+    )
+    return WAIT_RECIPIENT
+
+async def got_recipient(update, context):
+    context.user_data["give"]["recipient"] = update.message.text.strip().lstrip("@")
+    await update.message.reply_text("Укажи визуальный баланс (число):")
+    return WAIT_AMOUNT
+
+async def got_amount(update, context):
+    try:
+        amount = int(update.message.text.replace(",", "").strip())
+        if amount < 0: raise ValueError
+    except ValueError:
+        await update.message.reply_text("Введи неотрицательное число.")
+        return WAIT_AMOUNT
+    context.user_data["give"]["amount"] = amount
+    await update.message.reply_text("Укажи отображаемое имя для демо-профиля:")
+    return WAIT_NICK
+
+async def got_nick(update, context):
+    nick = update.message.text.strip()
+    if not nick or len(nick) > 64:
+        await update.message.reply_text("Имя должно содержать от 1 до 64 символов.")
+        return WAIT_NICK
+    context.user_data["give"]["nick"] = nick
+    await update.message.reply_text("Срок действия: например 1ч, 1д, 1мес или 1год:")
+    return WAIT_DURATION
+
+async def got_duration(update, context):
+    duration_text = update.message.text.strip()
     duration_ms = parse_duration(duration_text)
-    if duration_ms is None or duration_ms <= 0:
-        await update.message.reply_text(
-            "❌ Неверный срок. Примеры: 1ч, 1д, 1м, 1мес, 1год."
-        )
-        return
-
-    display_name = " ".join(args[2:-1]).strip()
-    if not display_name:
-        await update.message.reply_text("❌ Укажи визуальный никнейм.")
-        return
-
-    expires_at = int(time.time() * 1000) + duration_ms
-    s = get_settings(update.effective_user.id)
-
-    msg = await update.message.reply_text("⏳ Создаю временный ключ...")
+    if not duration_ms:
+        await update.message.reply_text("Неверный срок. Примеры: 1ч, 1д, 1мес, 1год.")
+        return WAIT_DURATION
+    data = context.user_data.pop("give", {})
+    settings = settings_for(update.effective_user.id).copy()
+    settings["robuxBalance"] = data["amount"]
+    settings["profileDisplayName"] = data["nick"]
+    payload = {
+        **settings,
+        "recipientTg": data["recipient"],
+        "robuxBalance": data["amount"],
+        "profileDisplayName": data["nick"],
+        "expiresAt": int(time.time()*1000) + duration_ms,
+    }
+    status = await update.message.reply_text("⏳ Создаю тестовый ключ…")
     try:
-        data = await api_post("/api/bot/create-key", {
-            **s,
-            "recipientTg": recipient_tg,
-            "robuxBalance": robux,
-            "profileDisplayName": display_name,
-            "expiresAt": expires_at,
-        })
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка при создании ключа:\n{e}")
-        return
-
-    key = data["key"]
-    cfg = data["config"]
-    login_url = f"{SITE_URL}/login"
-
-    admin_text = (
-        "✅ <b>Временный ключ создан</b>\n\n"
-        f"👤 Получатель: <code>{recipient_tg}</code>\n"
-        f"🔑 Ключ: <code>{key}</code>\n"
-        f"💎 RB: <b>{cfg['robuxBalance']:,}</b>\n"
-        f"📛 Визуальный ник: <code>{cfg['profileDisplayName']}</code>\n"
-        f"⏱ Срок: <b>{duration_text}</b>\n"
-        f"🌐 Вход: {login_url}"
-    )
-    await msg.edit_text(admin_text, parse_mode="HTML")
-
-    recipient_msg = (
-        "🔑 Ваш временный ключ доступа:\n\n"
-        f"<code>{key}</code>\n\n"
-        f"⏱ Срок: <b>{duration_text}</b>\n"
-        f"🌐 {login_url}"
-    )
-    try:
-        if recipient_tg.isdigit():
-            user_id = int(recipient_tg)
-        else:
-            user_id = ctx.bot_data.get(f"username:{recipient_tg.lower()}")
-
-        if user_id:
-            await ctx.bot.send_message(
-                chat_id=user_id,
-                text=recipient_msg,
-                parse_mode="HTML",
-            )
-            await update.message.reply_text("✅ Ключ отправлен получателю.")
-        else:
-            await update.message.reply_text(
-                "⚠️ Получатель ещё не писал этому боту.\n"
-                "Передай ему ключ вручную:\n\n" + recipient_msg,
-                parse_mode="HTML",
-            )
-    except Exception as e:
-        await update.message.reply_text(
-            f"⚠️ Не удалось отправить автоматически.\n"
+        result = await api("POST", "/api/bot/create-key", payload)
+        key = html.escape(str(result.get("key", "—")))
+        await status.edit_text(
+            "✅ <b>Тестовый ключ создан</b>\n\n"
+            f"Получатель: <code>{html.escape(data['recipient'])}</code>\n"
             f"Ключ: <code>{key}</code>\n"
-            f"Ссылка: {login_url}\n"
-            f"Причина: <code>{e}</code>",
-            parse_mode="HTML",
+            f"Срок: <b>{html.escape(duration_text)}</b>\n"
+            f"Страница демо: {html.escape(SITE_URL + '/login')}\n\n"
+            "Это демонстрационный доступ, не настоящая награда Roblox.",
+            parse_mode="HTML", reply_markup=menu()
         )
+    except Exception as exc:
+        log.exception("create-key failed")
+        await status.edit_text(f"❌ Не удалось создать ключ: {html.escape(str(exc))}")
+    return ConversationHandler.END
 
+async def cancel(update, context):
+    context.user_data.pop("give", None)
+    await update.effective_message.reply_text("Создание ключа отменено.", reply_markup=menu())
+    return ConversationHandler.END
 
-# ── /keys ─────────────────────────────────────────────────────────────────────
-async def keys_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
+async def keys_cmd(update, context):
+    if not is_admin(update): return
     try:
-        data = await api_get("/api/bot/keys")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
-        return
-
-    keys = data.get("keys", {})
-    if not keys:
-        await update.message.reply_text("Ключей нет.")
-        return
-
-    lines = [f"🔑 <b>Всего ключей: {len(keys)}</b>\n"]
-    for k, v in list(keys.items())[-10:]:  # last 10
-        status = "✅ использован" if v.get("used") else "🟢 активен"
-        recipient = v.get("recipientTg", "—")
-        lines.append(
-            f"• <code>{k}</code>\n"
-            f"  👤 @{recipient} | {status}\n"
-            f"  💎 {v.get('robuxBalance', '?'):,} RB | {v.get('profileUsername', '?')}"
+        data = await api("GET", "/api/bot/keys")
+        items = data.get("keys", {})
+        if not items:
+            await update.effective_message.reply_text("Ключей пока нет.", reply_markup=menu()); return
+        lines = [f"🔑 <b>Ключей: {len(items)}</b>"]
+        for key, info in list(items.items())[-15:]:
+            info = info if isinstance(info, dict) else {}
+            state = "использован" if info.get("used") else "активен"
+            lines.append(
+                f"\n• <code>{html.escape(str(key))}</code> — {state}\n"
+                f"  Получатель: <code>{html.escape(str(info.get('recipientTg','—')))}</code>\n"
+                f"  Визуальный баланс: {info.get('robuxBalance','—')}"
+            )
+        await update.effective_message.reply_text(
+            "\n".join(lines), parse_mode="HTML", reply_markup=menu()
         )
-    await update.message.reply_html("\n".join(lines))
+    except Exception as exc:
+        log.exception("keys failed")
+        await update.effective_message.reply_text(f"❌ Ошибка API: {exc}", reply_markup=menu())
 
-
-# ── /update — обновить глобальный конфиг ────────────────────────────────────
-async def update_config(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update):
-        return
-    s = get_settings(update.effective_user.id)
+async def update_config(update, context):
+    if not is_admin(update): return
     try:
-        data = await api_post("/api/bot/update-config", s)
-        await update.message.reply_html(
-            f"✅ Глобальный конфиг обновлён:\n"
-            f"💎 RB: <code>{s.get('robuxBalance', '?'):,}</code>\n"
-            f"👤 Ник: <code>{s.get('profileUsername', '?')}</code>"
+        s = settings_for(update.effective_user.id).copy()
+        result = await api("POST", "/api/bot/update-config", s)
+        await update.effective_message.reply_text(
+            "✅ Конфигурация демо-сайта отправлена.\n"
+            f"Визуальный баланс: {s['robuxBalance']:,}\n"
+            f"Профиль: {s['profileUsername']}",
+            reply_markup=menu()
         )
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ошибка: {e}")
+    except Exception as exc:
+        log.exception("update-config failed")
+        await update.effective_message.reply_text(f"❌ Ошибка API: {exc}", reply_markup=menu())
 
+async def callbacks(update, context):
+    q = update.callback_query
+    if not is_admin(update):
+        await q.answer("Нет доступа", show_alert=True); return
+    data = q.data or ""
+    if data == "menu":
+        await q.answer()
+        await q.edit_message_text("🛠 Панель управления демо-сайтом", reply_markup=menu())
+    elif data == "help":
+        await q.answer()
+        await q.edit_message_text(
+            "Команды: /give, /keys, /settings, /set, /update, /cancel",
+            reply_markup=menu()
+        )
+    elif data == "keys":
+        await q.answer()
+        try:
+            result = await api("GET", "/api/bot/keys")
+            items = result.get("keys", {})
+            lines = [f"🔑 Ключей: {len(items)}"]
+            for key, info in list(items.items())[-10:]:
+                info = info if isinstance(info, dict) else {}
+                lines.append(f"\n{key} — {'использован' if info.get('used') else 'активен'}")
+            await q.edit_message_text("\n".join(lines), reply_markup=menu())
+        except Exception as exc:
+            await q.edit_message_text(f"Ошибка API: {exc}", reply_markup=menu())
+    elif data == "settings":
+        await q.answer()
+        uid = update.effective_user.id
+        await q.edit_message_text(
+            await settings_text(uid), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💎 Баланс", callback_data="edit:robux"),
+                 InlineKeyboardButton("👤 Ник", callback_data="edit:nick")],
+                [InlineKeyboardButton("📛 Имя", callback_data="edit:name"),
+                 InlineKeyboardButton("🎁 Предмет", callback_data="edit:item")],
+                [InlineKeyboardButton("💰 Цена", callback_data="edit:price")],
+                [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
+            ])
+        )
+    elif data.startswith("edit:"):
+        await q.answer()
+        field = data.split(":",1)[1]
+        await q.message.reply_text(f"Чтобы изменить поле, отправь: /set {field} новое_значение")
+    elif data == "update":
+        await q.answer()
+        try:
+            s = settings_for(update.effective_user.id).copy()
+            await api("POST", "/api/bot/update-config", s)
+            await q.edit_message_text("✅ Конфигурация демо-сайта обновлена.", reply_markup=menu())
+        except Exception as exc:
+            await q.edit_message_text(f"❌ Ошибка API: {exc}", reply_markup=menu())
+    elif data == "give":
+        await q.answer()
+        await q.message.reply_text("Запусти мастер командой /give.")
+    elif data == "cancel":
+        await q.answer()
+        context.user_data.pop("give", None)
+        await q.edit_message_text("Отменено.", reply_markup=menu())
 
-# ── Сохраняем username → user_id при любом сообщении ────────────────────────
-async def track_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user and user.username:
-        ctx.bot_data[f"username:{user.username.lower()}"] = user.id
+async def error_handler(update, context):
+    log.exception("Unhandled bot error", exc_info=context.error)
 
-
-# ── MAIN ─────────────────────────────────────────────────────────────────────
-def main() -> None:
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("Не задан BOT_TOKEN в Render Environment")
+    if not ADMIN_TOKEN:
+        raise RuntimeError("Не задан ADMIN_TOKEN в Render Environment")
     app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(MessageHandler(filters.ALL, track_user), group=-1)
-
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("give", give_start)],
+        states={
+            WAIT_RECIPIENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_recipient)],
+            WAIT_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_amount)],
+            WAIT_NICK: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_nick)],
+            WAIT_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_duration)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
+    )
+    app.add_handler(conv)
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("set", set_cmd))
-    app.add_handler(CommandHandler(["ключ", "key", "give"], give_key))
+    # Telegram command names must be Latin; /ключ is not registered.
+    app.add_handler(CommandHandler(["key", "givekey"], give_start))
     app.add_handler(CommandHandler("keys", keys_cmd))
     app.add_handler(CommandHandler("update", update_config))
-
-    print(f"🤖 Bot started. Site: {SITE_URL}")
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_error_handler(error_handler)
+    log.info("Bot starting; site=%s", SITE_URL)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
-
 
 if __name__ == "__main__":
     main()
