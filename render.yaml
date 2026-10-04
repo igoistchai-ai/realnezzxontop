@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: visual-gifter-demo
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: ADMIN_TOKEN
+        generateValue: true
+      - key: BOT_TOKEN
+        sync: false
+      - key: SITE_URL
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
